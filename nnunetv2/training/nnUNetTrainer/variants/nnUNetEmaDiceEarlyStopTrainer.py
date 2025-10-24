@@ -45,37 +45,6 @@ class EmaDiceEarlyStopTrainer(nnUNetTrainer):
         self._val_calls: int = 0
 
     # ---- helpers ----
-    @staticmethod
-    def _extract_val_dice(val_out: Any) -> float:
-        """
-        Try common keys nnU-Net v2 returns. Falls back to NaN-safe behavior.
-        """
-        if isinstance(val_out, dict):
-            # try typical keys
-            for k in (
-                "meanDice",
-                "mean_dice",
-                "aggregated_dice",
-                "dice",
-                "global_dice",
-            ):
-                if k in val_out:
-                    return float(val_out[k])
-            # some versions expose classwise stats; average them if present
-            if "dice_per_class" in val_out and isinstance(
-                val_out["dice_per_class"], (list, tuple)
-            ):
-                arr = np.asarray(val_out["dice_per_class"], dtype=float)
-                return float(np.nanmean(arr))
-            if "dice_per_class_and_case" in val_out:
-                arr = np.asarray(val_out["dice_per_class_and_case"], dtype=float)
-                return float(np.nanmean(arr))
-        # scalar?
-        try:
-            return float(val_out)
-        except Exception:
-            return float("nan")
-
     def _run_validation(self) -> float:
         """Run validation and extract Dice score."""
         with torch.no_grad():
@@ -86,14 +55,11 @@ class EmaDiceEarlyStopTrainer(nnUNetTrainer):
                 val_outputs.append(val_step)
             self.on_validation_epoch_end(val_outputs)
 
-        # Extract mean Dice from logger
-        dice_values = self.logger.my_fantastic_logging.get(
+        # Extract mean Dice from logger (logged by on_validation_epoch_end)
+        dice_per_class = self.logger.my_fantastic_logging.get(
             "dice_per_class_or_region", [[]]
-        )
-        if dice_values:
-            d = float(np.nanmean(dice_values[-1]))
-        else:
-            d = float("nan")
+        )[-1]
+        d = float(np.nanmean(dice_per_class))
 
         if not np.isfinite(d):
             self.print_to_log_file(
