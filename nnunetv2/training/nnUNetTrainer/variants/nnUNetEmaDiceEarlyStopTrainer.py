@@ -50,7 +50,7 @@ class EmaDiceEarlyStopTrainer(nnUNetTrainer):
         with torch.no_grad():
             self.on_validation_epoch_start()
             val_outputs = []
-            for batch_id in range(self.num_val_iterations_per_epoch):
+            for _ in range(self.num_val_iterations_per_epoch):
                 val_step = self.validation_step(next(self.dataloader_val))
                 val_outputs.append(val_step)
             self.on_validation_epoch_end(val_outputs)
