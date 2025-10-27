@@ -462,7 +462,8 @@ class TopKCELossWrapper(nn.Module):
         dice_loss = self._soft_dice(logits, yoh, valid_mask=vm)
 
         # Composite
-        return topk_loss + 0.5 * dice_loss
+        # return topk_loss + 0.5 * dice_loss
+        return topk_loss + 1.0 * dice_loss
 
     @staticmethod
     def _soft_dice(
@@ -658,6 +659,18 @@ class EmaDiceTopKCETrainer(BaseEmaEarlyStopTrainer, BaseLossTrainer):
     """
     EMA early stopping + Top-K CE loss.
     """
+
+    def __init__(
+        self,
+        plans: dict,
+        configuration: str,
+        fold: int,
+        dataset_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        # Add or ensure this line to increase foreground visibility in patches
+        self.oversample_foreground_percent = 0.9
 
     def _build_loss_module(self) -> nn.Module:
         # Get ignore label from label manager if it exists
