@@ -4,6 +4,9 @@ import math
 from os.path import join
 from typing import Optional
 
+from torch import autocast
+        from contextlib import nullcontext as dummy_context
+        
 import numpy as np
 import torch
 import torch.nn as nn
@@ -221,8 +224,6 @@ class BaseLossTrainer(nnUNetTrainer):
         Override train_step to build target dictionary for custom loss wrappers.
         Converts raw target tensor to dict with 'target', 'onehot', 'mask'.
         """
-        from torch.cuda.amp import autocast
-        from contextlib import nullcontext as dummy_context
 
         data = batch["data"]
         target_raw = batch["target"]
@@ -251,8 +252,9 @@ class BaseLossTrainer(nnUNetTrainer):
                 ).float()
 
         self.optimizer.zero_grad(set_to_none=True)
+        # For CUDA, use autocast('cuda'); for CPU/MPS, use dummy_context
         with (
-            autocast(self.device.type, enabled=True)
+            autocast(self.device.type)
             if self.device.type == "cuda"
             else dummy_context()
         ):
