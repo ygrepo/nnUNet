@@ -88,8 +88,16 @@ class FocalTverskyLossWrapper(nn.Module):
         self.ce = nn.CrossEntropyLoss(ignore_index=ce_ignore_index)
 
     def _one(self, logits, target):
-        y, yoh = target["target"], target["onehot"]
-        vm = target.get("mask", None)
+        # Handle both dict target (from train_step) and tensor target
+        # (from DeepSupervisionWrapper)
+        if isinstance(target, dict):
+            y, yoh = target["target"], target["onehot"]
+            vm = target.get("mask", None)
+        else:
+            # When called by DeepSupervisionWrapper, target is one-hot tensor
+            yoh = target
+            y = torch.argmax(yoh, dim=1)
+            vm = None
         return self.ft(logits, yoh, valid_mask=vm) + 0.2 * self.ce(logits, y)
 
     def forward(self, logits, target):
@@ -209,9 +217,17 @@ class TopKCELossWrapper(nn.Module):
         self.topk = TopKCrossEntropy(k_ratio=k_ratio, ignore_index=ce_ignore_index)
 
     def forward(self, logits, target):
-        y = target["target"]  # (B, ...)
-        yoh = target["onehot"]  # (B, C, ...)
-        vm = target.get("mask", None)  # optional (B,1,...) or (B,C,...), 1=valid
+        # Handle both dict target (from train_step) and tensor target
+        # (from DeepSupervisionWrapper)
+        if isinstance(target, dict):
+            y = target["target"]  # (B, ...)
+            yoh = target["onehot"]  # (B, C, ...)
+            vm = target.get("mask", None)  # optional (B,1,...) or (B,C,...)
+        else:
+            # When called by DeepSupervisionWrapper, target is one-hot
+            yoh = target
+            y = torch.argmax(yoh, dim=1)
+            vm = None
 
         topk_loss = self.topk(logits, y)
         dice_loss = self._soft_dice(logits, yoh, valid_mask=vm)
