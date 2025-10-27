@@ -13,37 +13,69 @@ from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 
 
 class FocalTverskyLoss(nn.Module):
-    """
-    Multi-class Focal Tversky loss
-    params:
-      alpha: weight for FN (↑alpha => penalize FN)
-      beta : weight for FP
-      gamma: focal focusing (>=1), e.g., 1.33–2.0
-      smooth: epsilon
-    expects: logits (B,C,...) and target one-hot (B,C,...)
-    """
-
-    def __init__(self, alpha=0.7, beta=0.3, gamma=1.5, smooth=1e-6):
+    def __init__(
+        self,
+        alpha=0.85,
+        beta=0.15,
+        gamma=1.33,
+        smooth=1e-6,
+        class_weights=None,
+        ignore_background=True,
+    ):
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.smooth = smooth
+        self.alpha, self.beta = alpha, beta
+        self.gamma, self.smooth = gamma, smooth
+        self.class_weights = class_weights
+        self.ignore_background = ignore_background
 
-    def forward(self, logits, target_onehot):
-        probs = torch.softmax(logits, dim=1)
-        dims = tuple(range(2, probs.ndim))
+    def _as_param(self, x, ref):
+        if isinstance(x, torch.Tensor):
+            return x.to(ref.device, ref.dtype).view(1, -1)
+        if isinstance(x, (int, float)):
+            return torch.tensor(x, device=ref.device, dtype=ref.dtype).view(1, 1)
+        return None
 
-        tp = (probs * target_onehot).sum(dims)
-        fp = (probs * (1 - target_onehot)).sum(dims)
-        fn = ((1 - probs) * target_onehot).sum(dims)
+    def forward(self, logits, target_onehot, valid_mask=None):
+        p = torch.softmax(logits, dim=1)  # (B,C,...)
+        dims = tuple(range(2, p.ndim))
 
-        tversky = (tp + self.smooth) / (
-            tp + self.alpha * fn + self.beta * fp + self.smooth
-        )
-        ft = torch.pow(1.0 - tversky, self.gamma)  # (B,C)
-        # ignore background (c=0) if your labels use 0 as bg
-        ft = ft[:, 1:] if ft.shape[1] > 1 else ft
+        if valid_mask is not None:
+            vm = valid_mask
+            if vm.ndim == p.ndim - 1:  # (B,1,...)
+                vm = vm.expand(-1, p.shape[1], *([-1] * (p.ndim - 2)))
+            p_ = p * vm
+            y_ = target_onehot * vm
+            invy_ = (1 - target_onehot) * vm
+        else:
+            p_, y_, invy_ = p, target_onehot, (1 - target_onehot)
+
+        tp = (p_ * y_).sum(dims)
+        fp = (p_ * invy_).sum(dims)
+        fn = ((1 - p_) * y_).sum(dims)
+
+        alpha = self._as_param(self.alpha, tp)
+        beta = self._as_param(self.beta, tp)
+        t = (tp + self.smooth) / (tp + alpha * fn + beta * fp + self.smooth)  # (B,C)
+        ft = (1.0 - t).clamp_min(0) ** self.gamma
+
+        if self.ignore_background and ft.size(1) > 1:
+            ft = ft[:, 1:]
+            cw = (
+                None
+                if self.class_weights is None
+                else self.class_weights.to(ft.device, ft.dtype)[1:]
+            )
+        else:
+            cw = (
+                None
+                if self.class_weights is None
+                else self.class_weights.to(ft.device, ft.dtype)
+            )
+
+        if cw is not None:
+            cw = cw / (cw.mean() + 1e-8)
+            ft = ft * cw.view(1, -1)
+
         return ft.mean()
 
 
@@ -67,18 +99,24 @@ class TopKCrossEntropy(nn.Module):
 
 
 class FocalTverskyLossWrapper(nn.Module):
-    """Wrapper to combine Focal Tversky and CE loss."""
-
-    def __init__(self):
+    def __init__(self, ce_ignore_index=-1):
         super().__init__()
-        self.ft = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=1.5, smooth=1e-6)
-        self.ce = nn.CrossEntropyLoss()
+        self.ft = FocalTverskyLoss(
+            alpha=0.85, beta=0.15, gamma=1.33, ignore_background=True
+        )
+        self.ce = nn.CrossEntropyLoss(ignore_index=ce_ignore_index)
+
+    def _one(self, logits, target):
+        y, yoh = target["target"], target["onehot"]
+        vm = target.get("mask", None)
+        return self.ft(logits, yoh, valid_mask=vm) + 0.2 * self.ce(logits, y)
 
     def forward(self, logits, target):
-        # target is dict with 'target' (long) and 'onehot' (float)
-        y = target["target"]
-        yoh = target["onehot"]
-        return self.ft(logits, yoh) + 0.2 * self.ce(logits, y)
+        if isinstance(logits, (list, tuple)):
+            weights = [1.0] + [0.5] * (len(logits) - 1)
+            s = sum(w * self._one(lg, target) for w, lg in zip(weights, logits))
+            return s / sum(weights)
+        return self._one(logits, target)
 
 
 class BaseLossTrainer(nnUNetTrainer):
@@ -120,7 +158,20 @@ class BaseLossTrainer(nnUNetTrainer):
 class FocalTverskyTrainer(BaseLossTrainer):
     """
     Replace the default DC+CE with Focal Tversky (optionally + small CE).
+    Recommended: crank up FG patch oversampling for tiny lesions.
     """
+
+    def __init__(
+        self,
+        plans: dict,
+        configuration: str,
+        fold: int,
+        dataset_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        # Increase foreground oversampling for better recall on small targets
+        self.oversample_foreground_percent = 0.9
 
     def _build_loss_module(self) -> nn.Module:
         return FocalTverskyLossWrapper()
@@ -172,7 +223,7 @@ class BaseEmaEarlyStopTrainer(nnUNetTrainer):
     # EMA smoothing factor in (0,1]; larger = less smoothing
     alpha: float = 0.2
     # validations without EMA improvement
-    patience: int = 20
+    patience: int = 30
     # minimal EMA improvement to reset patience
     min_delta: float = 1e-4
     warmup_validations: int = (
