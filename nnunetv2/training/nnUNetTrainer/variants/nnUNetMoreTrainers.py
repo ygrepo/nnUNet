@@ -79,25 +79,6 @@ class FocalTverskyLoss(nn.Module):
         return ft.mean()
 
 
-class TopKCrossEntropy(nn.Module):
-    """
-    Top-K CE: average CE over the hardest k% voxels.
-    k_ratio in (0,1] e.g., 0.2
-    """
-
-    def __init__(self, k_ratio=0.2):
-        super().__init__()
-        self.k_ratio = k_ratio
-
-    def forward(self, logits, target_long):
-        ce = F.cross_entropy(logits, target_long, reduction="none")  # (B, ...)
-        ce_flat = ce.view(ce.shape[0], -1)
-        k = ce_flat.shape[1] * self.k_ratio
-        k = max(1, int(k))
-        topk_vals, _ = torch.topk(ce_flat, k, dim=1)
-        return topk_vals.mean()
-
-
 class FocalTverskyLossWrapper(nn.Module):
     def __init__(self, ce_ignore_index=-1):
         super().__init__()
