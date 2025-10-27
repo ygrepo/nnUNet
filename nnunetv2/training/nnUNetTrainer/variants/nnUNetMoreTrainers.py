@@ -242,7 +242,9 @@ class BaseLossTrainer(nnUNetTrainer):
             # Single scale: build dictionary
             target_dict = {
                 "target": target_raw,
-                "onehot": self._convert_to_onehot(target_raw),
+                "onehot": self._convert_to_onehot(
+                    target_raw, self.label_manager.num_segmentation_classes
+                ),
             }
 
             # Add mask if ignore label is defined
@@ -274,21 +276,11 @@ class BaseLossTrainer(nnUNetTrainer):
         return {"loss": loss_val.detach().cpu().numpy()}
 
     @staticmethod
-    def _convert_to_onehot(target: torch.Tensor) -> torch.Tensor:
-        """
-        Convert long tensor to one-hot encoding.
-        Args:
-            target: (B, ...) long tensor with class indices
-        Returns:
-            (B, C, ...) one-hot encoded tensor
-        """
+    def _convert_to_onehot(target: torch.Tensor, num_classes: int) -> torch.Tensor:
         if target.ndim < 2:
             target = target.unsqueeze(0)
 
-        # Get number of classes from max value
-        num_classes = int(target.max().item()) + 1
-
-        # Create one-hot encoding
+        # Use the pre-defined num_classes, not the batch max
         onehot = torch.zeros(
             (target.shape[0], num_classes, *target.shape[1:]),
             dtype=torch.float32,
