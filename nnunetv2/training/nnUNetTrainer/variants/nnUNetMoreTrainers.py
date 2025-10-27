@@ -409,15 +409,9 @@ class TopKCrossEntropy(nn.Module):
         dbg = log_topk_fg_coverage(
             ce_flat, target_long.view(B, -1), valid, self.k_ratio
         )
-        # if (
-        #     torch.distributed.get_rank() == 0
-        #     if torch.distributed.is_initialized()
-        #     else True
-        # ):
-        for r in dbg[:3]:  # log a few
-            self.print_to_log_file(
-                f"[TopK dbg] {r}"
-            )  # (k/valid, fg_in_topk, fg_in_all, mean_topk_ce)
+        # Debug output: (k/valid, fg_in_topk, fg_in_all, mean_topk_ce)
+        for r in dbg[:3]:  # log a few samples
+            print(f"[TopK dbg] {r}")
 
         # Prevent ignored positions from being selected by topk by setting them
         # to -inf in a masked view (topk will never pick -inf when k < #valid).
