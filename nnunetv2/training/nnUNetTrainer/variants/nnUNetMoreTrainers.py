@@ -5,8 +5,8 @@ from os.path import join
 from typing import Optional
 
 from torch import autocast
-        from contextlib import nullcontext as dummy_context
-        
+from contextlib import nullcontext as dummy_context
+
 import numpy as np
 import torch
 import torch.nn as nn
