@@ -326,6 +326,32 @@ class FocalTverskyTrainer(BaseLossTrainer):
         return FocalTverskyLossWrapper(ce_ignore_index=ignore_idx)
 
 
+@torch.no_grad()
+def log_topk_fg_coverage(ce_map, target_idx, valid_mask, k_ratio):
+    """
+    ce_map: (B, N) unreduced CE flattened
+    target_idx: (B, N) long indices, 0=bg
+    valid_mask: (B, N) bool
+    """
+    B, N = ce_map.shape
+    k_per = (valid_mask.sum(1).float() * k_ratio).clamp_min(1).long()
+    rows = []
+    for b in range(B):
+        v = valid_mask[b]
+        if v.sum() == 0:
+            rows.append(("no-valid", 0.0, 0, 0))
+            continue
+        k = min(int(k_per[b]), int(v.sum()))
+        ce_b = ce_map[b].masked_fill(~v, float("-inf"))
+        topk_vals, topk_idx = torch.topk(ce_b, k, largest=True, sorted=False)
+        fg_all = (target_idx[b][v] > 0).float().mean().item()
+        fg_in_k = (target_idx[b][topk_idx] > 0).float().mean().item()
+        rows.append(
+            (f"k={k}/valid={int(v.sum())}", fg_in_k, fg_all, topk_vals.mean().item())
+        )
+    return rows
+
+
 class TopKCrossEntropy(nn.Module):
     """
     Top-k Cross-Entropy (per-sample).
@@ -379,6 +405,19 @@ class TopKCrossEntropy(nn.Module):
             valid = target_long.view(B, -1) != self.ignore_index  # (B, N)
         else:
             valid = torch.ones_like(ce_flat, dtype=torch.bool)  # (B, N)
+
+        dbg = log_topk_fg_coverage(
+            ce_flat, target_long.view(B, -1), valid, self.k_ratio
+        )
+        # if (
+        #     torch.distributed.get_rank() == 0
+        #     if torch.distributed.is_initialized()
+        #     else True
+        # ):
+        for r in dbg[:3]:  # log a few
+            self.print_to_log_file(
+                f"[TopK dbg] {r}"
+            )  # (k/valid, fg_in_topk, fg_in_all, mean_topk_ce)
 
         # Prevent ignored positions from being selected by topk by setting them
         # to -inf in a masked view (topk will never pick -inf when k < #valid).
