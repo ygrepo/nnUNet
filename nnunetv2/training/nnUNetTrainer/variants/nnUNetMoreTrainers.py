@@ -219,6 +219,26 @@ class BaseLossTrainer(nnUNetTrainer):
 
         return loss
 
+    def _build_target_dict(self, target_raw: torch.Tensor) -> dict:
+        """
+        Build target dictionary for loss function.
+        Converts raw target tensor to dict with 'target', 'onehot', 'mask'.
+        """
+        target_dict = {
+            "target": target_raw,
+            "onehot": self._convert_to_onehot(
+                target_raw, self.label_manager.num_segmentation_classes
+            ),
+        }
+
+        # Add mask if ignore label is defined
+        if self.label_manager.has_ignore_label:
+            target_dict["mask"] = (
+                target_raw != self.label_manager.ignore_label
+            ).float()
+
+        return target_dict
+
     def train_step(self, batch: dict) -> dict:
         """
         Override train_step to build target dictionary for custom loss wrappers.
@@ -240,18 +260,7 @@ class BaseLossTrainer(nnUNetTrainer):
             target_dict = target_raw
         else:
             # Single scale: build dictionary
-            target_dict = {
-                "target": target_raw,
-                "onehot": self._convert_to_onehot(
-                    target_raw, self.label_manager.num_segmentation_classes
-                ),
-            }
-
-            # Add mask if ignore label is defined
-            if self.label_manager.has_ignore_label:
-                target_dict["mask"] = (
-                    target_raw != self.label_manager.ignore_label
-                ).float()
+            target_dict = self._build_target_dict(target_raw)
 
         self.optimizer.zero_grad(set_to_none=True)
         # For CUDA, use autocast('cuda'); for CPU/MPS, use dummy_context
@@ -274,6 +283,97 @@ class BaseLossTrainer(nnUNetTrainer):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
         return {"loss": loss_val.detach().cpu().numpy()}
+
+    def validation_step(self, batch: dict) -> dict:
+        """
+        Override validation_step to handle target dictionary format.
+        Extracts the raw target tensor for dice calculation.
+        """
+        data = batch["data"]
+        target_raw = batch["target"]
+
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target_raw, list):
+            target_raw = [i.to(self.device, non_blocking=True) for i in target_raw]
+        else:
+            target_raw = target_raw.to(self.device, non_blocking=True)
+
+        # Build target dictionary for loss function
+        if isinstance(target_raw, list):
+            # Deep supervision: list of targets at different scales
+            target_dict = target_raw
+        else:
+            # Single scale: build dictionary
+            target_dict = self._build_target_dict(target_raw)
+
+        # Autocast can be annoying
+        with (
+            autocast(self.device.type, enabled=True)
+            if self.device.type == "cuda"
+            else dummy_context()
+        ):
+            output = self.network(data)
+            del data
+            l = self.loss(output, target_dict)
+
+        # we only need the output with the highest output resolution (if DS enabled)
+        if self.enable_deep_supervision:
+            output = output[0]
+            target_raw = target_raw[0]
+
+        # the following is needed for online evaluation. Fake dice (green line)
+        axes = [0] + list(range(2, output.ndim))
+
+        if self.label_manager.has_regions:
+            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+        else:
+            # no need for softmax
+            output_seg = output.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(
+                output.shape, device=output.device, dtype=torch.float32
+            )
+            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+            del output_seg
+
+        if self.label_manager.has_ignore_label:
+            if not self.label_manager.has_regions:
+                mask = (target_raw != self.label_manager.ignore_label).float()
+                # CAREFUL that you don't rely on target after this line!
+                target_raw[target_raw == self.label_manager.ignore_label] = 0
+            else:
+                if target_raw.dtype == torch.bool:
+                    mask = ~target_raw[:, -1:]
+                else:
+                    mask = 1 - target_raw[:, -1:]
+                # CAREFUL that you don't rely on target after this line!
+                target_raw = target_raw[:, :-1]
+        else:
+            mask = None
+
+        from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(
+            predicted_segmentation_onehot, target_raw, axes=axes, mask=mask
+        )
+
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        if not self.label_manager.has_regions:
+            # if we train with regions all segmentation heads predict some kind of foreground. In conventional
+            # (softmax training) there needs tobe one output for the background. We are not interested in the
+            # background Dice
+            # [1:] in order to remove background
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+
+        return {
+            "loss": l.detach().cpu().numpy(),
+            "tp_hard": tp_hard,
+            "fp_hard": fp_hard,
+            "fn_hard": fn_hard,
+        }
 
     @staticmethod
     def _convert_to_onehot(target: torch.Tensor, num_classes: int) -> torch.Tensor:
@@ -572,6 +672,15 @@ class BaseEmaEarlyStopTrainer(nnUNetTrainer):
         self.ema: Optional[float] = None
         self.bad_count: int = 0
         self._val_calls: int = 0
+
+    def validation_step(self, batch: dict) -> dict:
+        """
+        Override validation_step to delegate to BaseLossTrainer if available.
+        This ensures proper target dictionary handling for custom loss trainers.
+        """
+        # Use super() to get the next class in MRO that has validation_step
+        # If BaseLossTrainer is in the MRO, it will be called; otherwise nnUNetTrainer
+        return super().validation_step(batch)
 
     def _run_validation(self) -> float:
         """Run validation and extract Dice score."""
