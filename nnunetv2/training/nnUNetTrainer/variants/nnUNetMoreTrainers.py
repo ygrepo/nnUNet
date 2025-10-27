@@ -177,38 +177,81 @@ class FocalTverskyTrainer(BaseLossTrainer):
         return FocalTverskyLossWrapper()
 
 
-class TopKCELossWrapper(nn.Module):
-    """Wrapper to combine Top-K CE and Soft Dice loss."""
+class TopKCrossEntropy(nn.Module):
+    """
+    CE averaged over the hardest k% voxels per sample, with ignore support.
+    """
 
-    def __init__(self):
+    def __init__(self, k_ratio=0.2, ignore_index: int = -1):
         super().__init__()
-        self.topk = TopKCrossEntropy(k_ratio=0.2)
+        self.k_ratio = float(k_ratio)
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, target_long):
+        # logits: (B,C,...) ; target_long: (B, ...)
+        ce = F.cross_entropy(
+            logits, target_long, reduction="none", ignore_index=self.ignore_index
+        )  # (B, ...)
+        B = ce.shape[0]
+        ce_flat = ce.view(B, -1)  # (B, N)
+        # Mask out ignored positions (equal to 0 loss from CE w/ ignore_index)
+        # But we still must exclude them from the top-k selection.
+        if self.ignore_index is not None and self.ignore_index >= 0:
+            # Recompute a mask from target_long (1=valid,0=ignore)
+            valid = target_long.view(B, -1) != self.ignore_index
+        else:
+            valid = torch.ones_like(ce_flat, dtype=torch.bool)
+
+        # For invalid voxels, set loss to -inf so they are never chosen by topk
+        ce_masked = ce_flat.masked_fill(~valid, float("-inf"))
+
+        # choose k per sample based on number of valid voxels
+        k_per = (valid.sum(dim=1).float() * self.k_ratio).clamp_min(1).long()
+        vals = []
+        for b in range(B):
+            # if very few valid voxels, fallback to mean over valid
+            k = int(k_per[b])
+            if k >= valid[b].sum().item():
+                v = ce_flat[b][valid[b]].mean() if valid[b].any() else ce_flat[b].mean()
+            else:
+                topk_vals, _ = torch.topk(ce_masked[b], k, largest=True, sorted=False)
+                v = topk_vals.mean()
+            vals.append(v)
+        return torch.stack(vals).mean()
+
+
+class TopKCELossWrapper(nn.Module):
+    """Top-K CE + 0.5 * Soft Dice, with ignore support."""
+
+    def __init__(self, k_ratio=0.2, ce_ignore_index=-1):
+        super().__init__()
+        self.topk = TopKCrossEntropy(k_ratio=k_ratio, ignore_index=ce_ignore_index)
 
     def forward(self, logits, target):
-        y = target["target"]
-        yoh = target["onehot"]
+        y = target["target"]  # (B, ...)
+        yoh = target["onehot"]  # (B, C, ...)
+        vm = target.get("mask", None)  # optional (B,1,...) or (B,C,...), 1=valid
+
         topk_loss = self.topk(logits, y)
-        dice_loss = self._soft_dice(logits, yoh)
+        dice_loss = self._soft_dice(logits, yoh, valid_mask=vm)
         return topk_loss + 0.5 * dice_loss
 
     @staticmethod
-    def _soft_dice(logits, target_onehot, eps=1e-6):
-        p = torch.softmax(logits, dim=1)
+    def _soft_dice(logits, target_onehot, valid_mask=None, eps=1e-6):
+        p = torch.softmax(logits, dim=1)  # (B,C,...)
+        if valid_mask is not None:
+            vm = valid_mask
+            if vm.ndim == p.ndim - 1:  # (B,1,...)
+                vm = vm.expand(-1, p.shape[1], *([-1] * (p.ndim - 2)))
+            p = p * vm
+            target_onehot = target_onehot * vm
         dims = tuple(range(2, p.ndim))
         num = 2 * (p * target_onehot).sum(dims)
         den = (p + target_onehot).sum(dims) + eps
-        dice = 1 - (num / den)
-        dice = dice[:, 1:] if dice.shape[1] > 1 else dice
+        dice = 1 - (num / den)  # (B,C)
+        if dice.size(1) > 1:  # drop background
+            dice = dice[:, 1:]
         return dice.mean()
-
-
-class TopKCETrainer(BaseLossTrainer):
-    """
-    Replace CE with Top-K CE (optionally + Dice).
-    """
-
-    def _build_loss_module(self) -> nn.Module:
-        return TopKCELossWrapper()
 
 
 class BaseEmaEarlyStopTrainer(nnUNetTrainer):
