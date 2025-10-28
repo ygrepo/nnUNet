@@ -301,10 +301,14 @@ class BaseLossTrainer(nnUNetTrainer):
         # Build target dictionary for loss function
         if isinstance(target_raw, list):
             # Deep supervision: list of targets at different scales
+            # Pass raw list to loss (DeepSupervisionWrapper handles it)
             target_dict = target_raw
+            # Keep the first (highest resolution) target for dice calculation
+            target_for_dice = target_raw[0]
         else:
             # Single scale: build dictionary
             target_dict = self._build_target_dict(target_raw)
+            target_for_dice = target_raw
 
         # Autocast can be annoying
         with (
@@ -319,7 +323,6 @@ class BaseLossTrainer(nnUNetTrainer):
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
             output = output[0]
-            target_raw = target_raw[0]
 
         # the following is needed for online evaluation. Fake dice (green line)
         axes = [0] + list(range(2, output.ndim))
@@ -337,23 +340,23 @@ class BaseLossTrainer(nnUNetTrainer):
 
         if self.label_manager.has_ignore_label:
             if not self.label_manager.has_regions:
-                mask = (target_raw != self.label_manager.ignore_label).float()
+                mask = (target_for_dice != self.label_manager.ignore_label).float()
                 # CAREFUL that you don't rely on target after this line!
-                target_raw[target_raw == self.label_manager.ignore_label] = 0
+                target_for_dice[target_for_dice == self.label_manager.ignore_label] = 0
             else:
-                if target_raw.dtype == torch.bool:
-                    mask = ~target_raw[:, -1:]
+                if target_for_dice.dtype == torch.bool:
+                    mask = ~target_for_dice[:, -1:]
                 else:
-                    mask = 1 - target_raw[:, -1:]
+                    mask = 1 - target_for_dice[:, -1:]
                 # CAREFUL that you don't rely on target after this line!
-                target_raw = target_raw[:, :-1]
+                target_for_dice = target_for_dice[:, :-1]
         else:
             mask = None
 
         from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 
         tp, fp, fn, _ = get_tp_fp_fn_tn(
-            predicted_segmentation_onehot, target_raw, axes=axes, mask=mask
+            predicted_segmentation_onehot, target_for_dice, axes=axes, mask=mask
         )
 
         tp_hard = tp.detach().cpu().numpy()
